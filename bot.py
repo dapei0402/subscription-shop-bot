@@ -119,6 +119,19 @@ def init_db():
             content TEXT, price INTEGER)""",
         # 设置表：持久化收款卡等运行时配置（原版重启即丢失）
         """CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""",
+        # 交易流水表：记录充值/购买/退款/赠送/扣款等所有资金与订单动作，形成审计链
+        """CREATE TABLE IF NOT EXISTS transactions
+           (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            kind TEXT,              -- charge/purchase/refund/gift/deduct/referral/agent_topup
+            amount INTEGER,         -- 金额，正为入账、负为出账
+            status TEXT,            -- pending/completed/rejected/refunded
+            detail TEXT,            -- 备注（商品名、审核人、原因等）
+            ref_id INTEGER,         -- 关联ID（如 user_services.id / 商品id）
+            operator_id INTEGER,    -- 操作者（管理员ID；系统/用户自身为0）
+            created_at TEXT)""",
+        """CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_tx_kind ON transactions(kind)""",
     ]
     with _db_lock:
         with closing(db_connect()) as conn:
@@ -158,6 +171,44 @@ def is_bot_locked():
 
 def set_bot_locked(locked: bool):
     set_setting("locked", "1" if locked else "0")
+
+
+# 交易类型的中文标签，用于展示
+TX_KIND_LABELS = {
+    "charge": "💳 充值",
+    "purchase": "🛒 购买",
+    "refund": "↩️ 退款",
+    "gift": "🎁 赠送",
+    "deduct": "📉 扣款",
+    "referral": "👥 邀请奖励",
+    "agent_topup": "👑 代理调整",
+    "manual": "⚙️ 手动调整",
+}
+
+TX_STATUS_LABELS = {
+    "pending": "⏳ 待处理",
+    "completed": "✅ 已完成",
+    "rejected": "❌ 已拒绝",
+    "refunded": "↩️ 已退款",
+}
+
+
+def log_tx(user_id, kind, amount, status="completed", detail="", ref_id=0, operator_id=0):
+    """写入一条交易流水。所有资金/订单动作都应调用它，形成完整审计链。"""
+    db_execute(
+        "INSERT INTO transactions (user_id, kind, amount, status, detail, ref_id, operator_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, kind, amount, status, detail, ref_id, operator_id,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def get_user_transactions(user_id, limit=10):
+    return db_execute(
+        "SELECT kind, amount, status, detail, created_at FROM transactions "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit), fetch="all",
+    ) or []
 
 
 init_db()
@@ -249,11 +300,13 @@ def parse_two_ints(text):
         return None
 
 
-def issue_service(target_user_id: int, product_id: int, price: int):
+def issue_service(target_user_id: int, product_id: int, price: int, tx_kind="purchase",
+                  tx_detail="", operator_id=0):
     """
     从库存取一个未使用的配置并发放给用户。
     使用同一连接内的事务，避免「取到同一个配置发给两个人」的竞态。
-    返回 (product_name, content) 或 None（库存为空/商品不存在）。
+    同时在事务内写入交易流水（审计链）。
+    返回 (product_name, content, service_id) 或 None（库存为空/商品不存在）。
     """
     with _db_lock:
         with closing(db_connect()) as conn:
@@ -277,8 +330,16 @@ def issue_service(target_user_id: int, product_id: int, price: int):
                     "INSERT INTO user_services (user_id, type, content, price) VALUES (?, ?, ?, ?)",
                     (target_user_id, name, row[1], price),
                 )
+                service_id = cur.lastrowid
+                cur.execute(
+                    "INSERT INTO transactions (user_id, kind, amount, status, detail, ref_id, operator_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (target_user_id, tx_kind, -price, "completed",
+                     tx_detail or name, service_id, operator_id,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
                 conn.commit()
-                return name, row[1]
+                return name, row[1], service_id
             except Exception as e:
                 conn.rollback()
                 logging.exception("发放服务失败: %s", e)
@@ -287,8 +348,8 @@ def issue_service(target_user_id: int, product_id: int, price: int):
 
 def purchase_with_balance(user_id: int, product_id: int):
     """
-    钱包余额购买：在一个事务内校验余额、扣款、取库存、写订单。
-    返回 (product_name, content, price) 或错误字符串。
+    钱包余额购买：在一个事务内校验余额、扣款、取库存、写订单、记流水。
+    返回 (product_name, content, price, service_id) 或错误字符串。
     """
     with _db_lock:
         with closing(db_connect()) as conn:
@@ -319,12 +380,20 @@ def purchase_with_balance(user_id: int, product_id: int):
                     "INSERT INTO user_services (user_id, type, content, price) VALUES (?, ?, ?, ?)",
                     (user_id, p[0], row[1], final_price),
                 )
+                service_id = cur.lastrowid
                 cur.execute(
                     "UPDATE users SET balance = balance - ? WHERE user_id = ?",
                     (final_price, user_id),
                 )
+                cur.execute(
+                    "INSERT INTO transactions (user_id, kind, amount, status, detail, ref_id, operator_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, "purchase", -final_price, "completed",
+                     f"钱包购买 {p[0]}", service_id, 0,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
                 conn.commit()
-                return p[0], row[1], final_price
+                return p[0], row[1], final_price, service_id
             except Exception as e:
                 conn.rollback()
                 logging.exception("余额购买失败: %s", e)
@@ -460,6 +529,7 @@ def handle_callbacks(call):
         p = data.split("_")
         target, amt = int(p[2]), int(p[3])
         update_user_balance(target, amt)
+        log_tx(target, "charge", amt, "completed", "卡转账充值（管理员通过）", operator_id=user_id)
         edit_caption_safe(f"充值已通过\n\n用户 {target} 余额增加 {amt:,}。",
                           call.message.chat.id, call.message.message_id)
         safe_send(target,
@@ -470,6 +540,7 @@ def handle_callbacks(call):
 
     if data.startswith("no_dp_"):
         target = int(data.split("_")[2])
+        log_tx(target, "charge", 0, "rejected", "卡转账充值（管理员拒绝）", operator_id=user_id)
         edit_caption_safe(f"用户 {target} 的充值回执已被拒绝。",
                           call.message.chat.id, call.message.message_id)
         safe_send(target,
@@ -516,11 +587,12 @@ def handle_callbacks(call):
             return
         target_info = get_user(target)
         final_price = calc_price(prod[1], target_info["is_agent"])
-        issued = issue_service(target, prod_id, final_price)
+        issued = issue_service(target, prod_id, final_price, tx_kind="purchase",
+                               tx_detail=f"卡转账购买 {prod[0]}（管理员通过）", operator_id=user_id)
         if not issued:
             bot.answer_callback_query(call.id, "错误：该商品库存为空", show_alert=True)
             return
-        name, content = issued
+        name, content, _sid = issued
         edit_caption_safe("购买回执已通过，订阅已发放。", call.message.chat.id, call.message.message_id)
         safe_send(target,
                   f"<b>你的服务已成功开通</b>\n\n"
@@ -532,6 +604,7 @@ def handle_callbacks(call):
 
     if data.startswith("no_by_"):
         target = int(data.split("_")[2])
+        log_tx(target, "purchase", 0, "rejected", "卡转账购买（管理员拒绝）", operator_id=user_id)
         edit_caption_safe(f"用户 {target} 的购买回执已被拒绝。",
                           call.message.chat.id, call.message.message_id)
         safe_send(target, "<b>你的购买申请因回执问题被拒绝</b>", parse_mode="HTML")
@@ -634,6 +707,8 @@ def handle_callbacks(call):
             pass
         if changed and u["referred_by"]:
             update_user_balance(u["referred_by"], REFERRAL_BONUS)
+            log_tx(u["referred_by"], "referral", REFERRAL_BONUS, "completed",
+                   f"邀请用户 {user_id} 奖励")
             safe_send(u["referred_by"],
                       f"<b>邀请新用户奖励</b>\n\n有一位用户通过你的链接加入\n\n"
                       f"{REFERRAL_BONUS:,} 元已加入你的钱包",
@@ -647,6 +722,24 @@ def handle_callbacks(call):
         bot.send_message(call.message.chat.id,
                          "<b>账户充值</b>\n\n请输入你要充值的金额（阿拉伯数字，单位：元）：",
                          parse_mode="HTML")
+        return
+
+    if data == "tx_history":
+        txs = get_user_transactions(user_id, limit=15)
+        if not txs:
+            bot.answer_callback_query(call.id, "你还没有任何交易记录", show_alert=True)
+            return
+        lines = ["<b>📜 你最近的交易记录</b>\n"]
+        for kind, amount, status, detail, created_at in txs:
+            klabel = TX_KIND_LABELS.get(kind, kind)
+            slabel = TX_STATUS_LABELS.get(status, status)
+            sign = "+" if amount > 0 else ""
+            lines.append(
+                f"{klabel} | {sign}{amount:,} 元 | {slabel}\n"
+                f"  {detail or '-'}  ·  {created_at}"
+            )
+        edit_text_safe("\n".join(lines), call.message.chat.id, call.message.message_id,
+                       parse_mode="HTML")
         return
 
     if data.startswith("buy_prod_"):
@@ -690,7 +783,7 @@ def handle_callbacks(call):
                     "商品不存在": "商品不存在", "处理出错": "处理过程出错，请重试"}
             bot.answer_callback_query(call.id, msgs.get(result, result), show_alert=True)
             return
-        name, content, price = result
+        name, content, price, _sid = result
         edit_text_safe(
             f"<b>你的服务已成功开通</b>\n\n"
             f"订阅类型: {name}\n\n"
@@ -781,6 +874,9 @@ def handle_text_messages(message):
                 return
             amount = m if cap == "2" else -m
             update_user_balance(t, amount)
+            log_tx(t, "manual", amount, "completed",
+                   "管理员手动增加余额" if cap == "2" else "管理员手动扣减余额",
+                   operator_id=user_id)
             bot.reply_to(message, "余额已成功增加" if cap == "2" else "余额已成功扣减")
             if cap == "2":
                 safe_send(t, f"<b>到账通知</b>\n\n{m:,} 元已加入你的账户余额", parse_mode="HTML")
@@ -830,11 +926,13 @@ def handle_text_messages(message):
             if cap == "8":
                 for (uid,) in users:
                     update_user_balance(uid, amt)
+                    log_tx(uid, "gift", amt, "completed", "全员赠送", operator_id=user_id)
                     safe_send(uid, f"<b>全员赠送</b>\n\n{amt:,} 元赠送金额已到账", parse_mode="HTML")
                 bot.reply_to(message, f"全员赠送完成，共 {len(users)} 人。")
             else:
                 for (uid,) in users:
                     update_user_balance(uid, -amt)
+                    log_tx(uid, "deduct", -amt, "completed", "全员扣款", operator_id=user_id)
                 bot.reply_to(message, f"全员扣款完成，共 {len(users)} 人。")
             return
 
@@ -980,11 +1078,11 @@ def handle_text_messages(message):
                              parse_mode="HTML")
                 return
 
-        issued = issue_service(user_id, 0, 0)
+        issued = issue_service(user_id, 0, 0, tx_kind="purchase", tx_detail="领取免费测试账号")
         if not issued:
             bot.reply_to(message, "目前库存中没有可用的测试账号")
             return
-        _, content = issued
+        _, content, _sid = issued
         db_execute("UPDATE users SET last_test_date = ? WHERE user_id = ?", (today_str, user_id))
         bot.reply_to(message, f"<b>测试连接配置已发放</b>\n\n<code>{content}</code>", parse_mode="HTML")
         return
@@ -1007,6 +1105,7 @@ def handle_text_messages(message):
     if text == "🏦 钱包 + 充值":
         markup = types.InlineKeyboardMarkup()
         markup.row(types.InlineKeyboardButton("➕ 充值余额（卡转账）", callback_data="wallet_charge"))
+        markup.row(types.InlineKeyboardButton("📜 交易记录", callback_data="tx_history"))
         bot.send_message(message.chat.id,
                          f"<b>钱包与余额管理</b>\n\n"
                          f"你的当前余额: {u['balance']:,} 元\n\n"
@@ -1174,6 +1273,7 @@ def handle_all_photos(message):
     if action == "send_charge_receipt":
         amount = state.get("amount", 0)
         user_states[user_id] = None
+        log_tx(user_id, "charge", amount, "pending", "卡转账充值（等待审核）")
         bot.reply_to(message, "已收到回执图片，正在排队审核。")
         markup = get_receipt_management_keyboard(user_id, "charge", amount=amount)
         try:
