@@ -121,7 +121,7 @@ def init_db():
             product_id INTEGER DEFAULT 0,   -- 关联商品ID，退款时用于把库存放回
             config_id INTEGER DEFAULT 0,    -- 关联的库存配置ID
             created_at TEXT)""",
-        # 设置表：持久化收款卡等运行时配置（原版重启即丢失）
+        # 设置表：持久化收款卡等运行时配置
         """CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""",
         # 交易流水表：记录充值/购买/退款/赠送/扣款等所有资金与订单动作，形成审计链
         """CREATE TABLE IF NOT EXISTS transactions
@@ -303,7 +303,7 @@ def get_user(user_id) -> dict:
 
 
 def update_user_balance(user_id, amount):
-    """余额变动。扣款时不允许扣成负数（原版可能出现负余额）。"""
+    """余额变动。扣款时不允许扣成负数。"""
     db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     if amount < 0:
         db_execute(
@@ -1011,12 +1011,12 @@ def handle_text_messages(message):
 
     admin = is_admin(user_id)
 
-    # 机器人锁定时，非管理员一律拦截（原版仅在 /start 拦截）
+    # 机器人锁定时，非管理员一律拦截
     if is_bot_locked() and not admin:
         bot.send_message(message.chat.id, "<b>机器人正在维护中，请稍后再试</b>", parse_mode="HTML")
         return
 
-    # 未加入频道 / 未接受条款的用户不能使用功能（原版存在绕过）
+    # 未加入频道 / 未接受条款的用户不能使用功能
     if not check_join(user_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(
