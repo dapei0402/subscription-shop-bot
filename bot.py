@@ -116,7 +116,11 @@ def init_db():
             content TEXT, is_used INTEGER DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS user_services
            (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT,
-            content TEXT, price INTEGER)""",
+            content TEXT, price INTEGER,
+            status TEXT DEFAULT 'active',   -- active（生效中）/ refunded（已退款）
+            product_id INTEGER DEFAULT 0,   -- 关联商品ID，退款时用于把库存放回
+            config_id INTEGER DEFAULT 0,    -- 关联的库存配置ID
+            created_at TEXT)""",
         # 设置表：持久化收款卡等运行时配置（原版重启即丢失）
         """CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""",
         # 交易流水表：记录充值/购买/退款/赠送/扣款等所有资金与订单动作，形成审计链
@@ -138,6 +142,16 @@ def init_db():
             cur = conn.cursor()
             for s in stmts:
                 cur.execute(s)
+            # ---- 轻量迁移：为老数据库的 user_services 补齐新列 ----
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(user_services)").fetchall()}
+            if "status" not in cols:
+                cur.execute("ALTER TABLE user_services ADD COLUMN status TEXT DEFAULT 'active'")
+            if "product_id" not in cols:
+                cur.execute("ALTER TABLE user_services ADD COLUMN product_id INTEGER DEFAULT 0")
+            if "config_id" not in cols:
+                cur.execute("ALTER TABLE user_services ADD COLUMN config_id INTEGER DEFAULT 0")
+            if "created_at" not in cols:
+                cur.execute("ALTER TABLE user_services ADD COLUMN created_at TEXT")
             if OWNER_ID:
                 cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
             cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_number', ?)",
@@ -327,8 +341,10 @@ def issue_service(target_user_id: int, product_id: int, price: int, tx_kind="pur
                     return None
                 cur.execute("UPDATE configs SET is_used = 1 WHERE id = ?", (row[0],))
                 cur.execute(
-                    "INSERT INTO user_services (user_id, type, content, price) VALUES (?, ?, ?, ?)",
-                    (target_user_id, name, row[1], price),
+                    "INSERT INTO user_services (user_id, type, content, price, status, product_id, config_id, created_at) "
+                    "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                    (target_user_id, name, row[1], price, product_id, row[0],
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
                 service_id = cur.lastrowid
                 cur.execute(
@@ -377,8 +393,10 @@ def purchase_with_balance(user_id: int, product_id: int):
                     return "库存为空"
                 cur.execute("UPDATE configs SET is_used = 1 WHERE id = ?", (row[0],))
                 cur.execute(
-                    "INSERT INTO user_services (user_id, type, content, price) VALUES (?, ?, ?, ?)",
-                    (user_id, p[0], row[1], final_price),
+                    "INSERT INTO user_services (user_id, type, content, price, status, product_id, config_id, created_at) "
+                    "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                    (user_id, p[0], row[1], final_price, product_id, row[0],
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
                 service_id = cur.lastrowid
                 cur.execute(
@@ -398,6 +416,62 @@ def purchase_with_balance(user_id: int, product_id: int):
                 conn.rollback()
                 logging.exception("余额购买失败: %s", e)
                 return "处理出错"
+
+
+def refund_service(service_id: int, operator_id: int, return_stock: bool = True):
+    """
+    管理员退款：在单事务内校验订单、退回余额、标记订单已退款、
+    （可选）把库存配置放回可售、写入退款流水。
+    返回 (user_id, service_name, refund_amount) 或错误字符串。
+    """
+    with _db_lock:
+        with closing(db_connect()) as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                s = cur.execute(
+                    "SELECT user_id, type, price, status, config_id FROM user_services WHERE id = ?",
+                    (service_id,),
+                ).fetchone()
+                if not s:
+                    conn.rollback()
+                    return "订单不存在"
+                svc_user, svc_type, svc_price, svc_status, svc_cfg = s
+                if svc_status == "refunded":
+                    conn.rollback()
+                    return "该订单已退款"
+
+                # 退回余额（免费订单退 0）
+                if svc_price and svc_price > 0:
+                    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                                (svc_price, svc_user))
+
+                # 标记订单已退款
+                cur.execute("UPDATE user_services SET status = 'refunded' WHERE id = ?", (service_id,))
+
+                # 库存放回（可选）：把对应配置重新标记为可售
+                if return_stock and svc_cfg:
+                    cur.execute("UPDATE configs SET is_used = 0 WHERE id = ?", (svc_cfg,))
+
+                # 写退款流水
+                cur.execute(
+                    "INSERT INTO transactions (user_id, kind, amount, status, detail, ref_id, operator_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (svc_user, "refund", svc_price or 0, "refunded",
+                     f"退款 {svc_type}" + ("（含库存回收）" if (return_stock and svc_cfg) else ""),
+                     service_id, operator_id,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                return svc_user, svc_type, (svc_price or 0)
+            except Exception as e:
+                conn.rollback()
+                logging.exception("退款失败: %s", e)
+                return "处理出错"
+
+
+def get_service_status_label(status: str) -> str:
+    return {"active": "🟢 生效中", "refunded": "↩️ 已退款"}.get(status, status)
 #__KEYBOARDS__
 # ============================== 键盘 ==============================
 
@@ -519,7 +593,8 @@ def handle_callbacks(call):
 
     # 管理员专属回调前缀，非管理员直接拒绝
     admin_prefixes = ("ok_dp_", "no_dp_", "ok_by_", "no_by_", "ok_ag_", "no_ag_",
-                      "adm_ban_", "adm_man_", "delprod_", "m_add_", "m_rst_", "cap_")
+                      "adm_ban_", "adm_man_", "adm_order_", "adm_refund_",
+                      "delprod_", "m_add_", "m_rst_", "cap_")
     if data.startswith(admin_prefixes) and not admin:
         bot.answer_callback_query(call.id, "⛔ 你没有管理员权限", show_alert=True)
         return
@@ -796,13 +871,79 @@ def handle_callbacks(call):
     if data.startswith("view_service_"):
         srv_id = int(data.split("_")[2])
         row = db_execute(
-            "SELECT type, content FROM user_services WHERE id = ? AND user_id = ?",
+            "SELECT type, content, price, status, created_at FROM user_services WHERE id = ? AND user_id = ?",
             (srv_id, user_id), fetch="one",
         )
         if row:
-            bot.send_message(call.message.chat.id,
-                             f"<b>服务详情</b>\n\n类型: {row[0]}\n\n访问密钥:\n<code>{row[1]}</code>",
-                             parse_mode="HTML")
+            svc_type, content, price, status, created_at = row
+            price_str = "免费 🎁" if not price else f"{price:,} 元"
+            markup = None
+            body = f"访问密钥:\n<code>{content}</code>"
+            if status == "refunded":
+                body = "（该订单已退款，密钥已失效）"
+            bot.send_message(
+                call.message.chat.id,
+                f"<b>服务详情</b>\n\n"
+                f"类型: {svc_type}\n"
+                f"金额: {price_str}\n"
+                f"状态: {get_service_status_label(status)}\n"
+                f"时间: {created_at or '-'}\n\n"
+                f"{body}",
+                parse_mode="HTML", reply_markup=markup,
+            )
+        return
+
+    # ---------- 管理员：查看某用户订单并可退款 ----------
+    if data.startswith("adm_order_") and is_admin(user_id):
+        srv_id = int(data.split("_")[2])
+        row = db_execute(
+            "SELECT user_id, type, price, status, created_at FROM user_services WHERE id = ?",
+            (srv_id,), fetch="one",
+        )
+        if not row:
+            bot.answer_callback_query(call.id, "订单不存在", show_alert=True)
+            return
+        svc_user, svc_type, price, status, created_at = row
+        price_str = "免费 🎁" if not price else f"{price:,} 元"
+        markup = types.InlineKeyboardMarkup()
+        if status == "active":
+            markup.row(types.InlineKeyboardButton("↩️ 退款并回收库存",
+                                                  callback_data=f"adm_refund_{srv_id}_1"))
+            markup.row(types.InlineKeyboardButton("↩️ 仅退款（不回收库存）",
+                                                  callback_data=f"adm_refund_{srv_id}_0"))
+        edit_text_safe(
+            f"<b>订单 #{srv_id}</b>\n\n"
+            f"用户: <code>{svc_user}</code>\n"
+            f"类型: {svc_type}\n"
+            f"金额: {price_str}\n"
+            f"状态: {get_service_status_label(status)}\n"
+            f"时间: {created_at or '-'}",
+            call.message.chat.id, call.message.message_id,
+            parse_mode="HTML", reply_markup=markup,
+        )
+        return
+
+    if data.startswith("adm_refund_") and is_admin(user_id):
+        parts = data.split("_")
+        srv_id = int(parts[2])
+        return_stock = parts[3] == "1"
+        result = refund_service(srv_id, operator_id=user_id, return_stock=return_stock)
+        if isinstance(result, str):
+            bot.answer_callback_query(call.id, result, show_alert=True)
+            return
+        svc_user, svc_type, amount = result
+        edit_text_safe(
+            f"✅ 订单 #{srv_id} 已退款\n\n"
+            f"用户: <code>{svc_user}</code>\n"
+            f"类型: {svc_type}\n"
+            f"退回金额: {amount:,} 元\n"
+            f"库存回收: {'是' if return_stock else '否'}",
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+        )
+        safe_send(svc_user,
+                  f"<b>退款通知</b>\n\n你的订单「{svc_type}」已被管理员退款\n\n"
+                  f"退回金额: {amount:,} 元已返还到你的余额",
+                  parse_mode="HTML")
         return
 #__TEXT__
 # ============================== 文本消息处理 ==============================
@@ -855,12 +996,22 @@ def handle_text_messages(message):
                 return
             target = int(text.strip())
             inf = get_user(target)
+            markup = types.InlineKeyboardMarkup()
+            svc_rows = db_execute(
+                "SELECT id, type, status FROM user_services WHERE user_id = ? ORDER BY id DESC LIMIT 20",
+                (target,), fetch="all") or []
+            for sid, stype, status in svc_rows:
+                tag = "" if status == "active" else "（已退款）"
+                markup.add(types.InlineKeyboardButton(
+                    f"🧾 #{sid} {stype}{tag}", callback_data=f"adm_order_{sid}"))
             bot.reply_to(message,
                          f"<b>账户状态</b>\n\n数字 ID: {target}\n\n"
                          f"余额: {inf['balance']:,} 元\n\n"
                          f"代理: {'是' if inf['is_agent'] else '否'}\n\n"
-                         f"封禁: {'是' if inf['is_banned'] else '否'}",
-                         parse_mode="HTML")
+                         f"封禁: {'是' if inf['is_banned'] else '否'}\n\n"
+                         f"（点击下方订单可退款）",
+                         parse_mode="HTML",
+                         reply_markup=markup if svc_rows else None)
             return
 
         if cap in ("2", "3"):
@@ -1115,14 +1266,17 @@ def handle_text_messages(message):
         return
 
     if text == "🛍️ 我的服务":
-        rows = db_execute("SELECT id, type FROM user_services WHERE user_id = ? ORDER BY id DESC",
-                          (user_id,), fetch="all") or []
+        rows = db_execute(
+            "SELECT id, type, status FROM user_services WHERE user_id = ? ORDER BY id DESC",
+            (user_id,), fetch="all") or []
         if not rows:
             bot.reply_to(message, "未找到你的任何有效服务。")
             return
         markup = types.InlineKeyboardMarkup()
-        for r in rows:
-            markup.add(types.InlineKeyboardButton(f"📦 {r[1]}", callback_data=f"view_service_{r[0]}"))
+        for sid, stype, status in rows:
+            tag = "" if status == "active" else "（已退款）"
+            markup.add(types.InlineKeyboardButton(f"📦 {stype}{tag}",
+                                                  callback_data=f"view_service_{sid}"))
         bot.send_message(message.chat.id, "🛍️ 你已购买的服务列表：", reply_markup=markup)
         return
 
