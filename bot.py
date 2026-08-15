@@ -15,6 +15,7 @@
   依赖：pip install pyTelegramBotAPI
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -46,7 +47,6 @@ DEFAULT_CARD_NAME = "收款人姓名"
 
 bot = telebot.TeleBot(API_TOKEN)
 
-user_states = {}
 _db_lock = threading.Lock()     # SQLite 写操作串行化，避免并发写冲突
 
 MAIN_COMMANDS = [
@@ -136,6 +136,9 @@ def init_db():
             created_at TEXT)""",
         """CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id)""",
         """CREATE INDEX IF NOT EXISTS idx_tx_kind ON transactions(kind)""",
+        # 用户会话状态表：持久化 user_states，机器人重启后不丢失待输入状态
+        """CREATE TABLE IF NOT EXISTS user_states
+           (user_id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT)""",
     ]
     with _db_lock:
         with closing(db_connect()) as conn:
@@ -226,7 +229,58 @@ def get_user_transactions(user_id, limit=10):
 
 
 init_db()
-#__HELPERS__
+
+
+# ============================== 会话状态（持久化） ==============================
+# 用一个「像字典一样用」的对象封装 user_states，底层落地到 SQLite。
+# 这样机器人重启后，用户正在进行的多步操作（如填金额、传回执）不会丢失。
+# 支持的用法保持不变：
+#   user_states[uid] = "state" / {...} / None
+#   user_states.get(uid)
+
+class PersistentStateStore:
+    def _serialize(self, value):
+        # None 表示清除状态
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False)
+
+    def _deserialize(self, raw):
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            # 兼容极端情况下的裸字符串
+            return raw
+
+    def __setitem__(self, user_id, value):
+        if value is None:
+            db_execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+            return
+        db_execute(
+            "INSERT INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            (user_id, self._serialize(value), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+
+    def get(self, user_id, default=None):
+        row = db_execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,), fetch="one")
+        if not row:
+            return default
+        return self._deserialize(row[0])
+
+    def __getitem__(self, user_id):
+        return self.get(user_id)
+
+    def pop(self, user_id, default=None):
+        val = self.get(user_id, default)
+        db_execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        return val
+
+
+user_states = PersistentStateStore()
+
 # ============================== 工具函数 ==============================
 
 def is_admin(user_id) -> bool:
